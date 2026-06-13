@@ -12,7 +12,7 @@ import { Badge } from "@/components/ui/badge";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
-import { Plus, ArrowLeft, Download, Trash2, ArrowUpRight, ArrowDownRight, FileText, Fuel, Wrench, Users } from "lucide-react";
+import { Plus, ArrowLeft, Download, Trash2, Pencil, ArrowUpRight, ArrowDownRight, FileText, Fuel, Wrench, Users } from "lucide-react";
 import { CATEGORIES, EQUIPMENT_NAMES, EQUIPMENT_CATEGORIES, LABOUR_ROLES, LABOUR_CATEGORIES, formatINR, formatDate } from "@/lib/constants";
 import { toast } from "sonner";
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip, LineChart, Line, XAxis, YAxis, CartesianGrid } from "recharts";
@@ -37,6 +37,16 @@ function SiteDetail() {
     category: "Other / अन्य",
     equipment: "",
     labourRole: "",
+  });
+
+  const [editOpen, setEditOpen] = useState(false);
+  const [editEntry, setEditEntry] = useState<any>(null);
+  const [editType, setEditType] = useState<"credit" | "debit">("debit");
+  const [editForm, setEditForm] = useState({
+    entry_date: "",
+    particular: "",
+    amount: "",
+    category: "Other / अन्य",
   });
 
   const { data: site } = useQuery({
@@ -102,6 +112,43 @@ function SiteDetail() {
       qc.invalidateQueries({ queryKey: ["entries-all"] });
     },
   });
+
+  const updateEntry = useMutation({
+    mutationFn: async () => {
+      if (!editEntry) return;
+      const amount = parseFloat(editForm.amount);
+      if (!amount || amount <= 0) throw new Error("Amount required");
+      const { error } = await supabase.from("entries").update({
+        entry_date: editForm.entry_date,
+        particular: editForm.particular,
+        category: editForm.category,
+        credit: editType === "credit" ? amount : 0,
+        debit: editType === "debit" ? amount : 0,
+      }).eq("id", editEntry.id);
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      toast.success("Entry updated");
+      setEditOpen(false);
+      setEditEntry(null);
+      qc.invalidateQueries({ queryKey: ["entries", siteId] });
+      qc.invalidateQueries({ queryKey: ["entries-all"] });
+    },
+    onError: (e: any) => toast.error(e.message),
+  });
+
+  function openEdit(e: any) {
+    const isCredit = Number(e.credit) > 0;
+    setEditType(isCredit ? "credit" : "debit");
+    setEditForm({
+      entry_date: e.entry_date,
+      particular: e.particular || "",
+      amount: String(isCredit ? e.credit : e.debit),
+      category: e.category,
+    });
+    setEditEntry(e);
+    setEditOpen(true);
+  }
 
   // Compute running balance
   const ledger = useMemo(() => {
@@ -187,120 +234,342 @@ function SiteDetail() {
     a.click(); URL.revokeObjectURL(url);
   }
 
+  // PDF helpers — strip Hindi text & replace ₹ (unsupported in helvetica)
+  function pdfAmt(n: number) {
+    return formatINR(n).replace(/₹\s?/, "Rs.");
+  }
+  function pdfDate(d: string) {
+    if (!d) return "";
+    const [y, m, day] = d.split("-");
+    return `${day}-${m}-${y}`;
+  }
+  function pdfText(s: string) {
+    if (!s) return "—";
+    // Keep only the English part before " / "
+    const eng = s.split(" / ")[0].trim();
+    // Remove any remaining non-ASCII characters
+    return eng.replace(/[^\x00-\x7F]/g, "").trim() || eng.replace(/[^\u0020-\u007E]/g, "").trim() || "—";
+  }
+
   function exportPDF() {
     const doc = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
     const pageW = doc.internal.pageSize.getWidth();
+    const pageH = doc.internal.pageSize.getHeight();
     const siteName = site?.name || "Site";
-    const dateFrom = ledger[ledger.length - 1] ? ledger[0].entry_date : "—";
-    const dateTo = ledger[ledger.length - 1]?.entry_date || "—";
+    const siteLocation = site?.location || "";
+    const dateFrom = ledger[0]?.entry_date || "";
+    const dateTo = ledger[ledger.length - 1]?.entry_date || "";
+    const generatedOn = new Date().toLocaleDateString("en-IN", { day: "2-digit", month: "long", year: "numeric" });
+    const ML = 14, MR = 14;
+    const contentW = pageW - ML - MR;
 
-    // Header background
-    doc.setFillColor(30, 41, 59);
-    doc.rect(0, 0, pageW, 28, "F");
+    // ── Colour palette ──────────────────────────────────────────
+    const NAVY  : [number,number,number] = [15,  37,  71];
+    const TEAL  : [number,number,number] = [2,  132, 119];
+    const GREEN : [number,number,number] = [21, 128,  61];
+    const RED   : [number,number,number] = [185,  28,  28];
+    const SLATE : [number,number,number] = [71,  85, 105];
+    const LIGHT : [number,number,number] = [241, 245, 249];
+    const WHITE : [number,number,number] = [255, 255, 255];
+    const BORDER: [number,number,number] = [203, 213, 225];
 
-    // Title
-    doc.setTextColor(255, 255, 255);
-    doc.setFontSize(16);
-    doc.setFont("helvetica", "bold");
-    doc.text("CASH REPORT", pageW / 2, 10, { align: "center" });
-
-    doc.setFontSize(11);
-    doc.setFont("helvetica", "normal");
-    doc.text(siteName.toUpperCase(), pageW / 2, 17, { align: "center" });
-
-    doc.setFontSize(9);
-    doc.text(`From: ${dateFrom}   To: ${dateTo}`, pageW / 2, 24, { align: "center" });
-
-    // Summary boxes
-    const boxY = 34;
-    const boxH = 18;
-    const boxW = (pageW - 30) / 3;
-    const boxes = [
-      { label: "Total Received", value: formatINR(totalCredit), color: [22, 163, 74] as [number,number,number] },
-      { label: "Total Spent", value: formatINR(totalDebit), color: [220, 38, 38] as [number,number,number] },
-      { label: "Closing Balance", value: formatINR(balance), color: [30, 41, 59] as [number,number,number] },
-    ];
-    boxes.forEach((b, i) => {
-      const x = 10 + i * (boxW + 5);
-      doc.setFillColor(...b.color);
-      doc.roundedRect(x, boxY, boxW, boxH, 2, 2, "F");
-      doc.setTextColor(255, 255, 255);
+    // ── Helper ──────────────────────────────────────────────────
+    function addPageFooter(pageNum: number, totalPages: number) {
+      const y = pageH - 8;
+      doc.setDrawColor(...BORDER);
+      doc.setLineWidth(0.3);
+      doc.line(ML, y - 3, pageW - MR, y - 3);
       doc.setFontSize(7);
+      doc.setTextColor(...SLATE);
       doc.setFont("helvetica", "normal");
-      doc.text(b.label.toUpperCase(), x + boxW / 2, boxY + 5.5, { align: "center" });
-      doc.setFontSize(10);
-      doc.setFont("helvetica", "bold");
-      doc.text(b.value, x + boxW / 2, boxY + 13, { align: "center" });
-    });
-
-    // Ledger table
-    const tableRows = ledger.map((e, idx) => [
-      String(idx + 1),
-      e.entry_date,
-      e.particular || "—",
-      e.category,
-      Number(e.credit) > 0 ? formatINR(Number(e.credit)) : "",
-      Number(e.debit) > 0 ? formatINR(Number(e.debit)) : "",
-      formatINR(e.balance),
-    ]);
-
-    // Total row
-    tableRows.push([
-      "", "",
-      "TOTAL",
-      "",
-      formatINR(totalCredit),
-      formatINR(totalDebit),
-      formatINR(balance),
-    ]);
-
-    autoTable(doc, {
-      startY: boxY + boxH + 6,
-      head: [["#", "Date", "Particular", "Category", "Credit", "Debit", "Balance"]],
-      body: tableRows,
-      styles: { fontSize: 7.5, cellPadding: 2.5, font: "helvetica", overflow: "linebreak" },
-      headStyles: { fillColor: [30, 41, 59], textColor: 255, fontStyle: "bold", fontSize: 8 },
-      columnStyles: {
-        0: { halign: "center", cellWidth: 8 },
-        1: { cellWidth: 20 },
-        2: { cellWidth: 60 },
-        3: { cellWidth: 30 },
-        4: { halign: "right", cellWidth: 22, textColor: [22, 163, 74] },
-        5: { halign: "right", cellWidth: 22, textColor: [220, 38, 38] },
-        6: { halign: "right", cellWidth: 22, fontStyle: "bold" },
-      },
-      didParseCell: (data) => {
-        // Total row styling
-        if (data.row.index === tableRows.length - 1) {
-          data.cell.styles.fontStyle = "bold";
-          data.cell.styles.fillColor = [241, 245, 249];
-        }
-        // Alternate row color
-        if (data.row.index % 2 === 0 && data.row.index !== tableRows.length - 1) {
-          data.cell.styles.fillColor = [248, 250, 252];
-        }
-      },
-      margin: { left: 10, right: 10 },
-    });
-
-    // Footer
-    const finalY = (doc as any).lastAutoTable.finalY + 6;
-    doc.setFontSize(7);
-    doc.setTextColor(150);
-    doc.setFont("helvetica", "normal");
-    doc.text(`Generated by SiteKhata  |  ${new Date().toLocaleDateString("en-IN")}`, pageW / 2, finalY, { align: "center" });
-
-    // Page numbers
-    const pageCount = (doc.internal as any).getNumberOfPages();
-    for (let i = 1; i <= pageCount; i++) {
-      doc.setPage(i);
-      doc.setFontSize(7);
-      doc.setTextColor(150);
-      doc.text(`Page ${i} of ${pageCount}`, pageW - 10, doc.internal.pageSize.getHeight() - 5, { align: "right" });
+      doc.text(`Generated: ${generatedOn}`, ML, y);
+      doc.text(`Page ${pageNum} of ${totalPages}`, pageW - MR, y, { align: "right" });
     }
 
-    doc.save(`${siteName}-Cash-Report.pdf`);
-    toast.success("PDF report downloaded!");
+    // ══════════════════════════════════════════════════════════════
+    // PAGE 1 — COVER + SUMMARY
+    // ══════════════════════════════════════════════════════════════
+
+    // Top accent bar
+    doc.setFillColor(...TEAL);
+    doc.rect(0, 0, pageW, 3, "F");
+
+    // Header block
+    doc.setFillColor(...NAVY);
+    doc.rect(0, 3, pageW, 44, "F");
+
+    // Watermark text — large faint
+    doc.setTextColor(255, 255, 255, 0.04 as any);
+    doc.setFontSize(52);
+    doc.setFont("helvetica", "bold");
+    doc.text("SITKHATA", pageW / 2, 35, { align: "center" });
+
+    // Company name top-left
+    doc.setTextColor(...TEAL);
+    doc.setFontSize(8);
+    doc.setFont("helvetica", "bold");
+    doc.text("SITEKHATA", ML, 13);
+    doc.setTextColor(180, 200, 220);
+    doc.setFontSize(6.5);
+    doc.setFont("helvetica", "normal");
+    doc.text("Contractor Cash Book", ML, 17.5);
+
+    // Report label top-right
+    doc.setTextColor(...TEAL);
+    doc.setFontSize(7);
+    doc.setFont("helvetica", "bold");
+    doc.text("CASH REPORT", pageW - MR, 13, { align: "right" });
+    doc.setTextColor(180, 200, 220);
+    doc.setFontSize(6.5);
+    doc.setFont("helvetica", "normal");
+    doc.text(generatedOn, pageW - MR, 17.5, { align: "right" });
+
+    // Site name — big centred
+    doc.setTextColor(...WHITE);
+    doc.setFontSize(18);
+    doc.setFont("helvetica", "bold");
+    doc.text(siteName.toUpperCase(), pageW / 2, 32, { align: "center" });
+
+    // Location + period — small under site name
+    const periodStr = dateFrom && dateTo
+      ? `${pdfDate(dateFrom)}  to  ${pdfDate(dateTo)}`
+      : "All entries";
+    doc.setFontSize(7.5);
+    doc.setFont("helvetica", "normal");
+    doc.setTextColor(180, 200, 220);
+    const subLine = siteLocation ? `${siteLocation}   |   ${periodStr}` : periodStr;
+    doc.text(subLine, pageW / 2, 39, { align: "center" });
+
+    // Bottom teal stripe under header
+    doc.setFillColor(...TEAL);
+    doc.rect(0, 47, pageW, 1.5, "F");
+
+    // ── Summary KPI cards (4 boxes) ──────────────────────────────
+    const cardY = 55;
+    const cardH = 22;
+    const gap   = 4;
+    const cardW = (contentW - gap * 3) / 4;
+
+    const kpis = [
+      { label: "TOTAL RECEIVED",  value: pdfAmt(totalCredit), color: GREEN,  bg: [240, 253, 244] as [number,number,number] },
+      { label: "TOTAL SPENT",     value: pdfAmt(totalDebit),  color: RED,    bg: [254, 242, 242] as [number,number,number] },
+      { label: "NET BALANCE",     value: pdfAmt(balance),     color: NAVY,   bg: LIGHT },
+      { label: "TOTAL ENTRIES",   value: String(entries.length), color: TEAL,   bg: [240, 253, 250] as [number,number,number] },
+    ];
+
+    kpis.forEach((k, i) => {
+      const x = ML + i * (cardW + gap);
+      // Card background
+      doc.setFillColor(...k.bg);
+      doc.roundedRect(x, cardY, cardW, cardH, 2, 2, "F");
+      // Left accent bar
+      doc.setFillColor(...k.color);
+      doc.roundedRect(x, cardY, 2.5, cardH, 1, 1, "F");
+      // Label
+      doc.setFontSize(6);
+      doc.setFont("helvetica", "bold");
+      doc.setTextColor(...SLATE);
+      doc.text(k.label, x + 6, cardY + 7);
+      // Value
+      doc.setFontSize(11);
+      doc.setFont("helvetica", "bold");
+      doc.setTextColor(...k.color);
+      doc.text(k.value, x + 6, cardY + 16);
+    });
+
+    // ── Category breakdown mini-table ────────────────────────────
+    let curY = cardY + cardH + 8;
+
+    if (byCategory.length > 0) {
+      // Section header
+      doc.setFillColor(...NAVY);
+      doc.rect(ML, curY, contentW, 7, "F");
+      doc.setTextColor(...WHITE);
+      doc.setFontSize(7.5);
+      doc.setFont("helvetica", "bold");
+      doc.text("EXPENSE BREAKDOWN BY CATEGORY", ML + 4, curY + 4.8);
+      curY += 7;
+
+      const catRows = byCategory.map((c, i) => [
+        String(i + 1),
+        pdfText(c.name),
+        pdfAmt(c.value as number),
+        `${totalDebit > 0 ? ((c.value as number / totalDebit) * 100).toFixed(1) : "0"}%`,
+      ]);
+
+      autoTable(doc, {
+        startY: curY,
+        head: [["#", "Category", "Amount", "Share"]],
+        body: catRows,
+        margin: { left: ML, right: MR },
+        styles: { fontSize: 7.5, cellPadding: { top: 2.5, bottom: 2.5, left: 3, right: 3 }, font: "helvetica" },
+        headStyles: { fillColor: SLATE, textColor: WHITE, fontStyle: "bold", fontSize: 7.5 },
+        columnStyles: {
+          0: { halign: "center", cellWidth: 8 },
+          1: { cellWidth: 90 },
+          2: { halign: "right", cellWidth: 38, textColor: RED },
+          3: { halign: "right", cellWidth: 22, textColor: SLATE },
+        },
+        alternateRowStyles: { fillColor: [248, 250, 252] },
+        didParseCell: (d) => {
+          if (d.row.index === catRows.length - 1 && d.section === "body") {
+            d.cell.styles.fontStyle = "bold";
+          }
+        },
+      });
+      curY = (doc as any).lastAutoTable.finalY + 6;
+    }
+
+    // ── Advance summary on page 1 ────────────────────────────────
+    if (advanceEntries.length > 0) {
+      const remH = pageH - curY - 20;
+      if (remH > 30) {
+        doc.setFillColor(...NAVY);
+        doc.rect(ML, curY, contentW, 7, "F");
+        doc.setTextColor(...WHITE);
+        doc.setFontSize(7.5);
+        doc.setFont("helvetica", "bold");
+        doc.text("ADVANCE TRACKER", ML + 4, curY + 4.8);
+        curY += 7;
+
+        const advRows = advanceEntries.map((e: any) => [
+          pdfDate(e.entry_date),
+          pdfText(e.particular || ""),
+          pdfText(e.category),
+          pdfAmt(Number(e.debit)),
+        ]);
+        advRows.push(["", "", "TOTAL ADVANCE", pdfAmt(totalAdvance)]);
+
+        autoTable(doc, {
+          startY: curY,
+          head: [["Date", "Particular", "Category", "Amount"]],
+          body: advRows,
+          margin: { left: ML, right: MR },
+          styles: { fontSize: 7.5, cellPadding: { top: 2.5, bottom: 2.5, left: 3, right: 3 } },
+          headStyles: { fillColor: SLATE, textColor: WHITE, fontStyle: "bold" },
+          columnStyles: {
+            0: { cellWidth: 22 },
+            1: { cellWidth: 70 },
+            2: { cellWidth: 50 },
+            3: { halign: "right", cellWidth: 26, textColor: RED, fontStyle: "bold" },
+          },
+          alternateRowStyles: { fillColor: [248, 250, 252] },
+          didParseCell: (d) => {
+            if (d.row.index === advRows.length - 1 && d.section === "body") {
+              d.cell.styles.fontStyle = "bold";
+              d.cell.styles.fillColor = LIGHT;
+            }
+          },
+        });
+      }
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // PAGE 2+ — FULL CASH LEDGER
+    // ══════════════════════════════════════════════════════════════
+    doc.addPage();
+
+    // Page 2 header band
+    doc.setFillColor(...NAVY);
+    doc.rect(0, 0, pageW, 16, "F");
+    doc.setFillColor(...TEAL);
+    doc.rect(0, 16, pageW, 1.2, "F");
+
+    doc.setTextColor(...WHITE);
+    doc.setFontSize(10);
+    doc.setFont("helvetica", "bold");
+    doc.text("CASH LEDGER", ML, 10);
+    doc.setFontSize(7);
+    doc.setFont("helvetica", "normal");
+    doc.setTextColor(180, 200, 220);
+    doc.text(siteName, pageW / 2, 10, { align: "center" });
+    doc.text(`Entries: ${entries.length}   |   Period: ${pdfDate(dateFrom)} to ${pdfDate(dateTo)}`, pageW - MR, 10, { align: "right" });
+
+    // Ledger rows — oldest first (day → month → year order)
+    const sortedLedger = [...ledger].sort((a, b) => a.entry_date.localeCompare(b.entry_date));
+    const ledgerRows = sortedLedger.map((e: any, idx: number) => [
+      String(idx + 1),
+      pdfDate(e.entry_date),
+      pdfText(e.particular || ""),
+      pdfText(e.category),
+      Number(e.credit) > 0 ? pdfAmt(Number(e.credit)) : "",
+      Number(e.debit)  > 0 ? pdfAmt(Number(e.debit))  : "",
+      pdfAmt(e.balance),
+    ]);
+
+    // Grand total row
+    ledgerRows.push(["", "", "GRAND TOTAL", "", pdfAmt(totalCredit), pdfAmt(totalDebit), pdfAmt(balance)]);
+
+    autoTable(doc, {
+      startY: 20,
+      head: [["#", "Date", "Particular", "Category", "Credit (Rs.)", "Debit (Rs.)", "Balance (Rs.)"]],
+      body: ledgerRows,
+      margin: { left: ML, right: MR },
+      styles: {
+        fontSize: 7.5,
+        cellPadding: { top: 3, bottom: 3, left: 3, right: 3 },
+        font: "helvetica",
+        lineColor: BORDER,
+        lineWidth: 0.2,
+        overflow: "linebreak",
+      },
+      headStyles: {
+        fillColor: NAVY,
+        textColor: WHITE,
+        fontStyle: "bold",
+        fontSize: 8,
+        cellPadding: { top: 4, bottom: 4, left: 3, right: 3 },
+      },
+      columnStyles: {
+        0: { halign: "center", cellWidth: 8,  textColor: SLATE },
+        1: { cellWidth: 20 },
+        2: { cellWidth: 58 },
+        3: { cellWidth: 36 },
+        4: { halign: "right", cellWidth: 24, textColor: GREEN, fontStyle: "bold" },
+        5: { halign: "right", cellWidth: 24, textColor: RED,   fontStyle: "bold" },
+        6: { halign: "right", cellWidth: 24, textColor: NAVY,  fontStyle: "bold" },
+      },
+      alternateRowStyles: { fillColor: [248, 250, 252] },
+      didParseCell: (data) => {
+        const isTotal = data.row.index === ledgerRows.length - 1 && data.section === "body";
+        if (isTotal) {
+          data.cell.styles.fillColor = NAVY;
+          data.cell.styles.textColor = WHITE;
+          data.cell.styles.fontStyle = "bold";
+          data.cell.styles.fontSize  = 8;
+        }
+        // Credit cell green, debit cell red for body rows
+        if (data.section === "body" && !isTotal) {
+          if (data.column.index === 4 && data.cell.text[0]) data.cell.styles.textColor = GREEN;
+          if (data.column.index === 5 && data.cell.text[0]) data.cell.styles.textColor = RED;
+          if (data.column.index === 6) {
+            const bal = sortedLedger[data.row.index]?.balance ?? 0;
+            data.cell.styles.textColor = bal >= 0 ? NAVY : RED;
+          }
+        }
+      },
+      didDrawPage: () => {
+        // Re-draw top band on every new page
+        doc.setFillColor(...NAVY);
+        doc.rect(0, 0, pageW, 16, "F");
+        doc.setFillColor(...TEAL);
+        doc.rect(0, 16, pageW, 1.2, "F");
+        doc.setTextColor(...WHITE);
+        doc.setFontSize(10);
+        doc.setFont("helvetica", "bold");
+        doc.text("CASH LEDGER", ML, 10);
+      },
+    });
+
+    // ── Page footers on ALL pages ────────────────────────────────
+    const totalPages = (doc.internal as any).getNumberOfPages();
+    for (let i = 1; i <= totalPages; i++) {
+      doc.setPage(i);
+      addPageFooter(i, totalPages);
+    }
+
+    doc.save(`${siteName.replace(/\s+/g, "-")}-Cash-Report.pdf`);
+    toast.success("Professional PDF downloaded!");
   }
 
   return (
@@ -592,7 +861,7 @@ function SiteDetail() {
                 <th className="text-right px-5 py-3 font-medium">Credit</th>
                 <th className="text-right px-5 py-3 font-medium">Debit</th>
                 <th className="text-right px-5 py-3 font-medium">Balance</th>
-                <th className="w-10"></th>
+                <th className="w-20"></th>
               </tr>
             </thead>
             <tbody className="divide-y">
@@ -611,9 +880,14 @@ function SiteDetail() {
                   <td className="px-5 py-3 text-right num">{Number(e.debit) > 0 ? <span className="text-destructive font-semibold">{formatINR(Number(e.debit))}</span> : <span className="text-muted-foreground/30">—</span>}</td>
                   <td className="px-5 py-3 text-right num font-bold">{formatINR(e.balance)}</td>
                   <td className="px-2">
-                    <Button variant="ghost" size="sm" onClick={() => { if (confirm("Delete this entry?")) deleteEntry.mutate(e.id); }}>
-                      <Trash2 className="size-3.5 text-muted-foreground hover:text-destructive" />
-                    </Button>
+                    <div className="flex items-center gap-1">
+                      <Button variant="ghost" size="sm" onClick={() => openEdit(e)}>
+                        <Pencil className="size-3.5 text-muted-foreground" />
+                      </Button>
+                      <Button variant="ghost" size="sm" onClick={() => { if (confirm("Delete this entry?")) deleteEntry.mutate(e.id); }}>
+                        <Trash2 className="size-3.5 text-muted-foreground hover:text-destructive" />
+                      </Button>
+                    </div>
                   </td>
                 </tr>
               ))}
@@ -621,6 +895,51 @@ function SiteDetail() {
           </table>
         </div>
       </Card>
+      {/* Edit Entry Dialog */}
+      <Dialog open={editOpen} onOpenChange={v => { if (!v) { setEditOpen(false); setEditEntry(null); } }}>
+        <DialogContent>
+          <DialogHeader><DialogTitle>Entry Edit Karo</DialogTitle></DialogHeader>
+          <Tabs value={editType} onValueChange={(v) => setEditType(v as any)}>
+            <TabsList className="grid grid-cols-2 w-full">
+              <TabsTrigger value="debit" className="data-[state=active]:bg-destructive/10 data-[state=active]:text-destructive">
+                <ArrowUpRight className="size-4" /> Debit (Spent)
+              </TabsTrigger>
+              <TabsTrigger value="credit" className="data-[state=active]:bg-success/10 data-[state=active]:text-success">
+                <ArrowDownRight className="size-4" /> Credit (Received)
+              </TabsTrigger>
+            </TabsList>
+            <TabsContent value={editType} className="space-y-4 mt-4">
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-1.5">
+                  <Label>Date</Label>
+                  <Input type="date" value={editForm.entry_date} onChange={e => setEditForm({ ...editForm, entry_date: e.target.value })} />
+                </div>
+                <div className="space-y-1.5">
+                  <Label>Amount ₹</Label>
+                  <Input type="number" inputMode="decimal" value={editForm.amount} onChange={e => setEditForm({ ...editForm, amount: e.target.value })} placeholder="0.00" />
+                </div>
+              </div>
+              <div className="space-y-1.5">
+                <Label>Category</Label>
+                <Select value={editForm.category} onValueChange={v => setEditForm({ ...editForm, category: v })}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {CATEGORIES.map(c => <SelectItem key={c} value={c}>{c}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1.5">
+                <Label>Particular / विवरण</Label>
+                <Textarea value={editForm.particular} onChange={e => setEditForm({ ...editForm, particular: e.target.value })} rows={3} />
+              </div>
+            </TabsContent>
+          </Tabs>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEditOpen(false)}>Cancel</Button>
+            <Button onClick={() => updateEntry.mutate()} disabled={updateEntry.isPending} className="bg-primary">Update</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
